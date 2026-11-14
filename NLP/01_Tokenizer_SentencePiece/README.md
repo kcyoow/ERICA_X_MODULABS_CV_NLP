@@ -40,120 +40,38 @@
 
 ## 진행 기록
 
-> 실험 진행하면서 채워 넣는 섹션. 선택 근거, 막힌 지점과 해결, 결과를 순서대로 남긴다.
-
 **전처리**
-- (작성 예정) NSMC 리뷰 길이 분포 / max_len 결정 근거
+- NSMC는 결측과 중복 리뷰를 제거해 train 146,182건을 사용했다. 리뷰 길이는 1~146자, 평균 35자.
+- `korean-english-park`에 맞춰 둔 길이 필터(10~150자)는 리뷰가 훨씬 짧은 NSMC에는 맞지 않아 적용하지 않았다.
+- `max_len`은 토크나이저마다 train 토큰 길이의 95% 지점으로 정했다(unigram 8,000 기준 52).
+- train을 8:2로 나눠 학습 116,946건, 검증 29,236건으로 사용했다.
 
 **구현 중 확인한 문제**
-- 노트북에 주어진 `sp_tokenize` 예시는 `EncodeAsIds` 결과(list)를 그대로 `pad_sequence`에 넘기는데, `pad_sequence`는 `torch.Tensor` 리스트를 요구하므로 `torch.tensor(...)`로 감싸야 한다.
-- SentencePiece 기본 id는 `0=<unk>, 1=<s>, 2=</s>`, pad는 비활성(-1). `padding_value=0`을 쓰면 패딩과 `<unk>`가 겹치므로, 학습 시 `--pad_id=0 --unk_id=1 --bos_id=2 --eos_id=3`으로 지정하거나 `nn.Embedding(padding_idx=...)`를 따로 맞춘다.
-- `korean-english-park`에 맞춰 둔 길이 필터(10~150자)는 NSMC에는 맞지 않음(리뷰가 훨씬 짧음). NSMC 분포를 다시 보고 기준을 잡아야 한다.
+- 노트북에 주어진 `sp_tokenize` 예시는 `EncodeAsIds` 결과(list)를 그대로 `pad_sequence`에 넘기는데, `pad_sequence`는 `torch.Tensor` 리스트를 요구하므로 `torch.tensor(...)`로 감쌌다.
+- SentencePiece 기본 id는 `0=<unk>, 1=<s>, 2=</s>`, pad는 비활성(-1)이다. `padding_value=0`을 쓰면 패딩과 `<unk>`가 겹치므로, 학습할 때 `--pad_id=0 --unk_id=1 --bos_id=2 --eos_id=3`으로 지정했다.
 
-**비교 실험 결과**
+**분류 모델**
+- BiLSTM(임베딩 128, hidden 128, Dropout 0.5). `pack_padded_sequence`로 패딩 구간을 건너뛴다.
+- 최대 5 epoch 학습하고, validation 정확도가 가장 높았던 가중치로 test를 평가했다.
 
-| 토크나이저 | model_type | vocab_size | 문장당 평균 토큰 수 | 임베딩 파라미터 | test acc |
-|---|---|:---:|:---:|:---:|:---:|
-| MeCab | – | – | | | |
-| SentencePiece | unigram | 4,000 | | | |
-| SentencePiece | unigram | 8,000 | | | |
-| SentencePiece | unigram | 16,000 | | | |
-| SentencePiece | bpe | 8,000 | | | |
+**비교 실험 결과** (Colab GPU, 조건별 1회 실행)
 
----
-
-## 심화: 임베딩 테이블 오버헤드와 Kronecker Embeddings
-
-### 왜 이 주제인가
-
-토크나이저의 vocab 크기 `V`는 토크나이저 파일 크기보다 **모델 안의 두 행렬**에 영향을 준다.
-
-- 입력 임베딩 `V × d`
-- 출력 LM head `d × V`
-
-몸통(어텐션·FFN)이 작아질수록 이 두 행렬의 비중이 커진다. 공개된 수치로는:
-
-| 모델 | vocab | 임베딩(+head) 비중 | 출처 |
-|---|:---:|:---:|---|
-| 125M (d=512, V=32k) | 32k | 20% 이상 | MobileLLM |
-| LLaMA-7B / 70B | 32k | 3.7% / 0.7% | MobileLLM |
-| Gemma 2 2.6B (tied) | 256k | 22% | Modular Tokenizers (EMNLP 2026) |
-| Llama 3.2 1B | 128k | 메모리의 20% 이상 | VocabTailor (ACL 2026) |
-| Gemma 3 270M | 262k | **63%** (268M 중 168M) | Embeddings Are Overpriced? |
-
-이번 과제의 `vocab_size` 비교 실험은 이 트레이드오프를 소형 분류기에서 직접 측정해 보는 것과 같다. 여기서 한 걸음 더 나가, **임베딩 테이블 자체를 없애는 방법**을 하나 골라 같은 분류기에서 재현해 본다.
-
-### 논문: Kronecker Embeddings (Shravan, arXiv 2605.29459, 2026.05)
-
-**문제** — 모든 트랜스포머 LM은 토큰 id → `|V| × d_model` 학습 테이블 lookup으로 시작한다. 이 테이블은 소형 모델에서 파라미터의 1/4~절반을 차지하고, 양자화 시에도 보통 16비트로 남는다.
-
-**방법** — 학습되는 테이블을 **고정 인코더 + 학습되는 projection 하나**로 교체한다.
-
-1. 토큰의 UTF-8 바이트열 `b_1 … b_L`에 대해, 각 위치 `p`에서 (바이트 값 one-hot `c_{b_p}` ∈ R^{d_c}) ⊗ (위치 one-hot `p_p` ∈ R^{d_p})를 계산한다. 결과는 `D = d_c · d_p` 차원에서 좌표 `b_p · d_p + p` 하나만 1인 벡터.
-2. 토큰의 모든 바이트에 대해 이를 합산하고 길이로 정규화하면, 토큰마다 **결정론적인 sparse multi-hot 벡터** `κ ∈ R^D`가 나온다. 학습 파라미터 없음, gradient 없음. 논문 설정은 `d_c = 256, d_p = 16, D = 4096`.
-3. 학습되는 선형층 `W: R^D → R^{d_model}` 하나로 projection. 입력 쪽 학습 파라미터는 `D × d_model`이며 **vocab 크기와 무관**하다.
-
-ALBERT의 factorized embedding(`E = V_E · E_F`)과 같은 계열이지만, 첫 번째 인자가 학습되지 않고 토큰의 바이트 구성으로 결정된다는 점이 다르다.
-
-**결과 (논문 보고 기준)**
-- nanoGPT GPT-2 124M, FineWeb-Edu 2.5B 토큰, 3시드: 입력 임베딩 38.6M → 3.1M으로 줄이면서 validation loss **2.5 ± 0.2% 감소**(약 9% 낮은 perplexity), 18/18 체크포인트×시드에서 일관.
-- 오타 1글자 섞은 110쌍 프롬프트에서 top-1 예측 유지율 55.5% vs 47.3% — 바이트 유사성이 임베딩 유사성으로 이어지는 "byte-level locality" 덕분.
-- 프로덕션 규모(vocab 131k, D=8192): 2.15GB 테이블 대신 4.5MB 바이트 버퍼 + projection으로 대체, 재계산 오버헤드 0.01~0.24%.
-
-**논문이 밝힌 한계**
-- 바이트가 비슷하면 의미가 달라도 가까워진다 (`compute`/`commute`). 구분은 첫 어텐션 층의 몫.
-- tied embedding 모델에서는 output head가 분리되므로 124M 기준 **전체 파라미터는 +3.1M**. "91~94% 절감"은 입력 쪽만의 수치다.
-- 단독 저자 preprint이며, CharCNN·ByT5 같은 바이트 수준 베이스라인과의 직접 비교가 빠져 있다.
-
-### 이 과제에서의 재현 설계
-
-분류기에는 LM head가 없으므로 위의 "+3.1M" 문제가 없고, 입력 쪽 절감이 그대로 전체 절감이 된다.
-
-**고정**: SentencePiece(unigram) 토크나이저, BiLSTM(hidden 128) + Linear 분류기, 동일한 학습 설정. **임베딩 층만 교체.**
-
-| 조건 | 입력 임베딩 | 학습 파라미터 (V=8k) | (V=32k) |
-|---|---|:---:|:---:|
-| Baseline | `nn.Embedding(V, 128)` | 1.02M | 4.1M |
-| Kron-byte | 바이트 × 위치 (256 × 16 = 4096) → `Linear(4096, 128)` | 0.52M | 0.52M |
-| Kron-jamo | 초·중·종성 자모 × 위치 (~70 × 8 = 560) → `Linear(560, 128)` | 0.07M | 0.07M |
-
-- **Kron-jamo**는 한국어 특화 변형. UTF-8에서 한글 한 글자는 3바이트라 바이트 단위는 낭비가 크다. 초성 19 · 중성 21 · 종성 28(없음 포함)로 분해하면 알파벳이 약 70개로 줄어 `D`가 7배 작아진다. 논문도 바이트 bigram 등 다른 factorization이 가능하다고 열어 두었다.
-- 구현: `[V, D]` codec 테이블을 미리 한 번 계산해 두고 forward는 `K[ids] @ W`. 자모 버전은 32k × 560 float32 ≈ 72MB라 dense로 충분하다.
-
-**측정 항목**
-1. test accuracy — vocab 4k / 8k / 16k / 32k × 3조건
-2. 임베딩 쪽 학습 파라미터 수 (실측)
-3. 오타 강건성 — 테스트 리뷰에서 한 글자씩 치환한 뒤 accuracy 재측정 (논문의 typo probe를 분류 버전으로)
-4. 수렴 속도 — epoch별 validation accuracy 곡선
-
-**예상과 리스크**
-- 분류 태스크는 LM보다 임베딩 표현력 의존도가 낮아 accuracy는 비슷하거나 소폭 하락할 가능성이 크다. 파라미터 절감 대비 하락 폭, 그리고 오타 강건성 변화를 함께 보는 것이 목적이다.
-- 결과가 나쁘더라도 "LM에서의 이득이 분류로 전이되지 않는 이유"를 분석하면 그 자체가 회고가 된다. 결과 방향을 미리 정하지 않는다.
-
-**결과** (작성 예정)
-
-| 조건 | vocab | 임베딩 파라미터 | test acc | 오타 acc | 수렴 epoch |
+| 토크나이저 | 사전 크기 | 리뷰당 평균 토큰 수 | 임베딩 파라미터 | best val acc | test acc |
 |---|:---:|:---:|:---:|:---:|:---:|
-| Baseline | 8k | | | | |
-| Kron-byte | 8k | | | | |
-| Kron-jamo | 8k | | | | |
-| Baseline | 32k | | | | |
-| Kron-byte | 32k | | | | |
-| Kron-jamo | 32k | | | | |
+| MeCab 형태소 | 8,000 | 18.7 | 1,024,000 | 0.8659 | **0.8602** |
+| SentencePiece unigram | 4,000 | 20.2 | 512,000 | 0.8452 | 0.8467 |
+| SentencePiece unigram | 8,000 | 17.3 | 1,024,000 | 0.8435 | 0.8469 |
+| SentencePiece unigram | 16,000 | 15.4 | 2,048,000 | 0.8426 | 0.8422 |
+| SentencePiece bpe | 8,000 | 17.0 | 1,024,000 | 0.8433 | 0.8472 |
+| MeCab 형태소 → SentencePiece | 8,000 | 20.4 | 1,024,000 | 0.8579 | 0.8568 |
+| MeCab 형태소 + 품사 태그 → SentencePiece | 8,000 | 21.8 | 1,024,000 | 0.8579 | 0.8567 |
 
-## 회고
-
-(작성 예정)
+- SentencePiece(unigram 8,000)만 쓴 분류기의 test 정확도는 84.69%로 루브릭 기준 80%를 넘었다.
+- `model_type`과 `vocab_size`를 바꿔도 SentencePiece 조건끼리의 차이는 0.5%p 이내였다. 사전을 4,000으로 줄이면 임베딩 파라미터는 절반이 되지만 정확도는 거의 같다.
+- MeCab 형태소 기반이 86.02%로 가장 높았고, 형태소로 먼저 나눈 뒤 SentencePiece를 학습하면 SentencePiece만 쓸 때보다 약 1%p 올랐다.
 
 ## 참고 자료
 
 - [google/sentencepiece](https://github.com/google/sentencepiece)
 - [NSMC — Naver Sentiment Movie Corpus](https://github.com/e9t/nsmc/)
 - [jungyeul/korean-parallel-corpora](https://github.com/jungyeul/korean-parallel-corpora)
-- Shravan, R. *Kronecker Embeddings: Byte-Level Structured Token Representations for Parameter-Efficient Language Models.* arXiv:2605.29459 (2026). https://arxiv.org/abs/2605.29459
-- Liu, Z. et al. *MobileLLM: Optimizing Sub-billion Parameter Language Models for On-Device Use Cases.* arXiv:2402.14905 (2024). https://arxiv.org/abs/2402.14905
-- *To Each Language Its Tokenizer: Modular Tokenizers for Efficient Multilingual LLMs.* Findings of EMNLP 2026. https://aclanthology.org/2026.findings-emnlp.1019.pdf
-- *VocabTailor: Dynamic Vocabulary Selection for Downstream Tasks in Small Language Models.* Findings of ACL 2026. https://aclanthology.org/2026.findings-acl.1418.pdf
-- Nozaki, Y. et al. *Efficient Vocabulary Reduction for Small Language Models.* COLING 2025 Industry Track. https://aclanthology.org/2025.coling-industry.64.pdf
-- Bathula, S. K. *Embeddings Are Overpriced? A Frozen 16 MB Vocabulary for Small and Ternary Language Models.* arXiv:2610.22428 (2026). https://arxiv.org/abs/2610.22428
-- Lan, Z. et al. *ALBERT: A Lite BERT for Self-supervised Learning of Language Representations.* ICLR 2020.
